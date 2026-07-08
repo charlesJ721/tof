@@ -1,0 +1,27 @@
+version: "0.1"
+
+phases:
+  scout:
+    artifact: RESEARCH.md
+    inputs: {}
+    required_fields:
+      - scout.affected_files
+      - scout.dependency_graph
+      - scout.verification_functions
+      - scout.risk_areas
+      - scout.unknowns
+      - scout.implicit_dependencies
+    field_rules:
+      scout.unknowns:
+        min_items: 1
+    verdict_field: scout.verdict
+    verdicts:
+      PASS:
+        next: null
+      EXPLORE:
+        next: exploration
+      FAIL:
+        next: scout
+        retry:
+          max_rounds: 2
+          exhausted: escalation

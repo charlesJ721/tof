@@ -1,0 +1,47 @@
+version: "0.1"
+timeout_policy:
+  max_retries: 3
+  retry_interval_seconds: 60
+  on_exhaustion: blocking_ex
+model_freshness:
+  max_staleness_days: 30
+  on_stale: warning
+phases:
+  clarify:
+    artifact: TASK.md
+    inputs: {}
+    required_fields: [task.verdict]
+    verdict_field: task.verdict
+    verdicts: {READY: {next: scout}}
+  scout:
+    artifact: RESEARCH.md
+    inputs: {required: [clarify]}
+    required_fields: [scout.verdict, scout.unknowns]
+    field_rules: {scout.unknowns: {min_items: 1}}
+    verdict_field: scout.verdict
+    verdicts: {PASS: {next: establish}}
+  establish:
+    artifact: PLAN.md
+    inputs: {required: [scout]}
+    required_fields: [plan.verdict]
+    verdict_field: plan.verdict
+    verdicts: {READY: {next: review}}
+  review:
+    artifact: REVIEW.md
+    inputs: {required: [establish]}
+    required_fields: [review.verdict, review.findings]
+    verdict_field: review.verdict
+    model_policy: {family_must_differ_from: establish}
+    verdicts: {PASS: {next: implement}}
+  implement:
+    artifact: IMPLEMENTATION_LOG.md
+    inputs: {required: [establish, review]}
+    required_fields: [implement.verdict]
+    verdict_field: implement.verdict
+    verdicts: {PASS: {next: verify}}
+  verify:
+    artifact: VERIFICATION.md
+    inputs: {required: [establish, implement]}
+    required_fields: [verify.verdict]
+    verdict_field: verify.verdict
+    verdicts: {PASS: {next: null}}

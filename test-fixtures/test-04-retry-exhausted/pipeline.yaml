@@ -1,0 +1,42 @@
+version: "0.1"
+
+phases:
+  establish:
+    artifact: PLAN.md
+    inputs: {}
+    required_fields:
+      - plan.architecture
+      - plan.steps
+      - plan.verification_functions
+      - plan.rollback
+      - plan.out_of_scope
+      - plan.execution_mode
+    verdict_field: plan.verdict
+    verdicts:
+      READY:
+        next: review
+      NEEDS_USER:
+        next: pause
+
+  review:
+    artifact: REVIEW.md
+    inputs:
+      required:
+        - establish
+    required_fields:
+      - review.verdict
+      - review.findings
+      - review.blocking
+    verdict_field: review.verdict
+    model_policy:
+      family_must_differ_from: establish
+    verdicts:
+      PASS:
+        next: null
+      WEAKNESS_FOUND:
+        next: establish
+      BLOCKING:
+        next: establish
+        retry:
+          max_rounds: 2
+          exhausted: escalation

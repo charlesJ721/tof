@@ -1,0 +1,35 @@
+name: TOF tests
+
+on:
+  push:
+    paths:
+      - 'TOF/**'
+  pull_request:
+    paths:
+      - 'TOF/**'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: TOF
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Lint pipeline
+        run: python3 tof lint-pipeline
+
+      - name: Fixture validation tests
+        run: python3 tests_expected.py
+
+      - name: Orchestrator unit tests
+        run: python3 test_orchestrator_unit.py
+
+      - name: Orchestrator integration tests
+        run: python3 test_orchestrator_integration.py

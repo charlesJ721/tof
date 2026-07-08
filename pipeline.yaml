@@ -1,0 +1,225 @@
+# pipeline.yaml — TOF phase DAG, artifact schema, transition rules, approval policy
+# Single source of truth. tof validate reads this file only.
+# DO NOT add next_allowed or transition logic to artifact frontmatter.
+
+version: "0.1"
+
+# ---- Runtime policies (enforced by tof validate) ----
+
+timeout_policy:
+  max_retries: 3
+  retry_interval_seconds: 60
+  on_exhaustion: blocking_ex
+  # When true, provider-level fallback (e.g., OpenRouter routing a request
+  # to a different model on 400 error) is treated as WARNING rather than
+  # INVALID. Default false: any detected fallback invalidates the artifact.
+  # Set true when using providers known to perform automatic failover.
+  allow_provider_fallback: false
+  # NOTE: timeout_policy governs HTTP call retries (model unresponsive).
+  # Phase-level retry (Review BLOCKING → Establish) is governed by
+  # per-phase retry.max_rounds, NOT by this policy.
+
+# OT subprocess dispatch timeout in seconds (default 300).
+# Models like Opus analyzing large codebases may need 600+.
+dispatch_timeout_seconds: 300
+
+model_freshness:
+  max_staleness_days: 30
+  # Default "warning": logs staleness in receipt but does NOT block the pipeline.
+  # Change to "blocking" if model slug accuracy is safety-critical for your
+  # deployment — e.g. if a stale slug could cause OT to silently fallback to a
+  # different model family, compromising the Review diversity guarantee.
+  on_stale: warning
+
+# verification_confidence — reserved. P0 does not enforce; always "info".
+# Future: set on_low_confidence=blocking + threshold=0.9 to reject artifacts
+# whose SessionAuditAdapter-reported confidence is below threshold.
+verification_confidence:
+  threshold: 0.9
+  on_low_confidence: info   # "info" (no block) | "warning" | "blocking"
+
+# ---- Dispatch configuration ----
+# Preferred argv template for the OT subprocess command. Variables:
+#   {prompt}     — full prompt text as one argv element (not shell-quoted)
+#   {provider}   — provider name from models.yaml
+#   {model}      — provider_model_id from models.yaml
+# Override to inject a stub for integration testing. command_template is kept
+# only for backward compatibility with older pipeline snapshots.
+dispatch:
+  command_argv: ["hermes", "chat", "-q", "{prompt}", "--provider", "{provider}", "--model", "{model}"]
+  command_template: 'hermes chat -q "{prompt}" --provider {provider} --model {model}'
+  # Path to agent log for session audit. ~ is expanded.
+  audit_log_path: "~/.hermes/logs/agent.log"
+
+# ---- Phase definitions ----
+
+phases:
+  # Standalone advisory phase — not part of the main SERI DAG
+  triage:
+    model: deepseek-v4-flash
+    prompt: "phases/triage/prompt.md"
+
+  clarify:
+    artifact: TASK.md
+    model: deepseek-v4-flash
+    inputs: {}
+    required_fields:
+      - task.scope
+      - task.success_criteria
+      - task.explicit_exclusions
+      - task.constraints
+    verdict_field: task.verdict
+    verdicts:
+      READY:
+        next: scout
+      NEEDS_USER:
+        next: pause
+    approval_policy: always
+
+  scout:
+    artifact: RESEARCH.md
+    model: claude-opus-4.8
+    inputs:
+      required:
+        - clarify
+    required_fields:
+      - scout.affected_files
+      - scout.dependency_graph
+      - scout.verification_functions
+      - scout.risk_areas
+      - scout.unknowns
+      - scout.implicit_dependencies
+    field_rules:
+      scout.unknowns:
+        min_items: 1
+      scout.implicit_dependencies:
+        min_items: 1
+    verdict_field: scout.verdict
+    verdicts:
+      PASS:
+        next: establish
+      EXPLORE:
+        next: exploration
+      FAIL:
+        next: scout
+        retry:
+          max_rounds: 2
+          exhausted: escalation
+
+  establish:
+    artifact: PLAN.md
+    model: gpt-5.5
+    inputs:
+      required:
+        - clarify
+        - scout
+    required_fields:
+      - establish.architecture
+      - establish.steps
+      - establish.verification_functions
+      - establish.rollback
+      - establish.out_of_scope
+      - establish.execution_mode
+    verdict_field: establish.verdict
+    verdicts:
+      READY:
+        next: review
+      NEEDS_USER:
+        next: pause
+    approval_policy: on_designer_assumption
+
+  review:
+    artifact: REVIEW.md
+    model: gemini-3.1-pro-preview
+    inputs:
+      required:
+        - scout
+        - establish
+    required_fields:
+      - review.verdict
+      - review.findings
+    required_if_verdict:
+      BLOCKING:
+        - review.blocking
+    verdict_field: review.verdict
+    model_policy:
+      family_must_differ_from: establish
+    verdicts:
+      PASS:
+        next: implement
+      WEAKNESS_FOUND:
+        next: establish
+      BLOCKING:
+        next: establish
+        retry:
+          max_rounds: 2
+          exhausted: escalation
+
+  implement:
+    artifact: IMPLEMENTATION_LOG.md
+    model: gpt-5.5
+    inputs:
+      required:
+        - establish
+        - review
+    required_fields:
+      - implement.diff_summary
+      - implement.tests_run
+      - implement.test_results
+      - implement.deviations_from_plan
+    verdict_field: implement.verdict
+    verdicts:
+      PASS:
+        next: verify
+      FAIL:
+        next: implement
+        retry:
+          max_rounds: 2
+          exhausted: escalation
+
+  verify:
+    artifact: VERIFICATION.md
+    model: deepseek-v4-pro
+    inputs:
+      required:
+        - establish
+        - implement
+      required_if_present:
+        - review
+    required_fields:
+      - verify.verdict
+      - verify.mismatches
+      - verify.vf_results
+    field_rules:
+      verify.mismatches:
+        allow_empty: true
+      verify.vf_results:
+        allow_empty: true
+    verdict_field: verify.verdict
+    verdicts:
+      PASS:
+        next: deposition
+      FAIL:
+        next: implement
+        retry:
+          max_rounds: 2
+          exhausted: escalation
+
+  deposition:
+    artifact: DEPOSITION_LOG.md
+    optional: true
+    inputs:
+      required:
+        - verify
+    required_fields:
+      - deposition.channels
+      - deposition.results
+    verdict_field: deposition.verdict
+    verdicts:
+      DONE:
+        next: null  # terminal
+      PARTIAL:
+        next: null  # terminal, channel failures logged
+      SKIPPED:
+        next: null
+    approval_policy: never_if_schema_valid

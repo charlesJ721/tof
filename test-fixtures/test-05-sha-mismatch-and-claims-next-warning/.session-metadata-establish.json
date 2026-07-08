@@ -1,0 +1,14 @@
+{
+  "phase": "establish",
+  "session_id": "fixture-test-05-artifact-claims-next-establish",
+  "timestamp": "2026-07-04T00:00:00Z",
+  "assigned_model": "unknown",
+  "actual_model": "unknown",
+  "actual_family": "fixture",
+  "fallback_detected": false,
+  "provider": "fixture",
+  "latency_ms": 0,
+  "verification_confidence": 0.7,
+  "method": "fixture",
+  "outcome": "verified_match"
+}

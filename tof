@@ -1,0 +1,1633 @@
+#!/usr/bin/env python3
+"""TOF validator — P1.3 complete.
+
+Read-only validator and pipeline consistency linter.
+Dependencies: Python stdlib + PyYAML.
+
+History: P0.1-P0.3 runtime hardening → P1.1-P1.3 execution layer → P2.x fidelity.
+See IMPLEMENTATION_STATUS.md for full capability matrix.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import yaml
+except ImportError:
+    print("error: PyYAML is required (import yaml failed)", file=sys.stderr)
+    sys.exit(2)
+
+SPECIAL_NEXT = {None, "pause", "escalation", "exploration"}
+PASSISH_VERDICTS = {"PASS", "READY", "DONE"}
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InputRef:
+    """A single input reference from tof.inputs[] in artifact frontmatter."""
+    declared_phase: str
+    sha256: str
+    path: Optional[str] = None
+    resolved: Optional["Artifact"] = None
+    valid: bool = False
+    reason: str = ""
+
+
+@dataclass
+class Artifact:
+    path: Path
+    frontmatter: Dict[str, Any]
+    content: str
+    phase: str
+    round: int
+    sha256: str
+    inputs: List[InputRef] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def die(message: str, code: int = 2) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def load_yaml_file(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        die(f"missing file: {path}")
+    except yaml.YAMLError as e:
+        die(f"invalid YAML in {path}: {e}")
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+    if not isinstance(data, dict):
+        die(f"YAML root must be a mapping: {path}")
+    return data
+
+
+def candidate_config_paths(run_dir: Optional[Path], filename: str) -> List[Path]:
+    paths: List[Path] = []
+    if run_dir is not None:
+        paths.append((run_dir / ".tof" / filename).resolve())   # snapshot (highest priority)
+        paths.append((run_dir / filename).resolve())              # run dir itself (fixture-local)
+        paths.append((run_dir / ".." / filename).resolve())      # parent dir
+    paths.append((Path.cwd() / filename).resolve())
+    tof_dir = os.environ.get("TOF_DIR")
+    if tof_dir:
+        paths.append((Path(tof_dir) / filename).resolve())
+    paths.append((Path(__file__).resolve().parent / filename).resolve())
+    deduped: List[Path] = []
+    seen = set()
+    for p in paths:
+        if str(p) not in seen:
+            seen.add(str(p))
+            deduped.append(p)
+    return deduped
+
+
+def locate_config(run_dir: Optional[Path], filename: str) -> Path:
+    for p in candidate_config_paths(run_dir, filename):
+        if p.exists():
+            return p
+    checked = ", ".join(str(p) for p in candidate_config_paths(run_dir, filename))
+    die(f"could not locate {filename}; checked: {checked}")
+    raise AssertionError("unreachable")
+
+
+def phase_items(pipeline: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    phases = pipeline.get("phases")
+    if not isinstance(phases, dict) or not phases:
+        die("pipeline.yaml must contain a non-empty 'phases' mapping")
+    return [(name, cfg) for name, cfg in phases.items() if name != "triage"]
+
+
+def get_path(obj: Any, dotted: str) -> Any:
+    cur = obj
+    for part in dotted.split("."):
+        if not part:
+            raise KeyError(dotted)
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            raise KeyError(dotted)
+    return cur
+
+
+def has_nonempty_path(obj: Any, dotted: str) -> bool:
+    try:
+        value = get_path(obj, dotted)
+    except KeyError:
+        return False
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    if isinstance(value, (list, dict)) and len(value) == 0:
+        return False
+    return True
+
+
+def is_nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, dict)):
+        return len(value) > 0
+    return True
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validation_id() -> str:
+    return "val_" + _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parsing
+# ---------------------------------------------------------------------------
+
+def parse_frontmatter(path: Path) -> Optional[Tuple[Dict[str, Any], str]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        warn(f"skipping non-UTF8 markdown file: {path}")
+        return None
+    except OSError as e:
+        warn(f"skipping unreadable markdown file {path}: {e}")
+        return None
+
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        warn(f"skipping markdown with unterminated frontmatter: {path}")
+        return None
+
+    raw_fm = "".join(lines[1:end_idx])
+    body = "".join(lines[end_idx + 1 :])
+    try:
+        fm = yaml.safe_load(raw_fm) or {}
+    except yaml.YAMLError as e:
+        warn(f"skipping markdown with invalid YAML frontmatter {path}: {e}")
+        return None
+    if not isinstance(fm, dict):
+        warn(f"skipping markdown with non-mapping frontmatter: {path}")
+        return None
+    return fm, body
+
+
+def parse_input_refs(fm: Dict[str, Any]) -> List[InputRef]:
+    """Parse tof.inputs from artifact frontmatter into InputRef objects."""
+    tof = fm.get("tof")
+    if not isinstance(tof, dict):
+        return []
+    raw = tof.get("inputs", [])
+    if not isinstance(raw, list):
+        return []
+    refs: List[InputRef] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        phase = item.get("phase")
+        sha = item.get("sha256")
+        if not phase or not sha:
+            continue
+        refs.append(InputRef(
+            declared_phase=str(phase),
+            sha256=str(sha),
+            path=str(item["path"]) if "path" in item and item["path"] else None,
+        ))
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# Scanning & indexing
+# ---------------------------------------------------------------------------
+
+def scan_artifacts(run_dir: Path, pipeline: Dict[str, Any]) -> List[Artifact]:
+    phases = {name for name, _cfg in phase_items(pipeline)}
+    artifacts: List[Artifact] = []
+    if not run_dir.exists():
+        die(f"run directory does not exist: {run_dir}")
+    if not run_dir.is_dir():
+        die(f"run path is not a directory: {run_dir}")
+
+    for path in sorted(run_dir.glob("*.md")):
+        parsed = parse_frontmatter(path)
+        if parsed is None:
+            continue
+        fm, body = parsed
+        tof = fm.get("tof")
+        if not isinstance(tof, dict):
+            continue
+        phase = tof.get("phase")
+        if phase not in phases:
+            continue
+        round_raw = tof.get("round", 1)
+        try:
+            round_num = int(round_raw)
+        except (TypeError, ValueError):
+            round_num = 1
+        refs = parse_input_refs(fm)
+        artifacts.append(Artifact(
+            path=path,
+            frontmatter=fm,
+            content=body,
+            phase=phase,
+            round=round_num,
+            sha256=file_sha256(path),
+            inputs=refs,
+        ))
+    return artifacts
+
+
+def build_indices(artifacts: List[Artifact]) -> Tuple[Dict[str, Artifact], Dict[str, List[Artifact]], Dict[str, List[Artifact]]]:
+    by_path: Dict[str, Artifact] = {}
+    by_phase: Dict[str, List[Artifact]] = {}
+    by_sha: Dict[str, List[Artifact]] = {}
+    for art in artifacts:
+        by_path[str(art.path.resolve())] = art
+        by_phase.setdefault(art.phase, []).append(art)
+        by_sha.setdefault(art.sha256, []).append(art)
+    for items in by_phase.values():
+        items.sort(key=lambda a: (a.round, a.path.stat().st_mtime, a.path.name))
+    return by_path, by_phase, by_sha
+
+
+def group_artifacts(artifacts: Iterable[Artifact]) -> Tuple[Dict[str, List[Artifact]], Dict[str, Artifact]]:
+    grouped: Dict[str, List[Artifact]] = {}
+    latest: Dict[str, Artifact] = {}
+    for art in artifacts:
+        grouped.setdefault(art.phase, []).append(art)
+    for phase, items in grouped.items():
+        items.sort(key=lambda a: (a.round, a.path.stat().st_mtime, a.path.name))
+        latest[phase] = items[-1]
+    return grouped, latest
+
+
+# ---------------------------------------------------------------------------
+# Input edge resolution (P0.2a core)
+# ---------------------------------------------------------------------------
+
+def resolve_input_edges(artifacts: List[Artifact], by_path: Dict[str, Artifact],
+                        by_phase: Dict[str, List[Artifact]], by_sha: Dict[str, List[Artifact]]) -> List[str]:
+    """Resolve each artifact's InputRefs to target Artifact nodes.
+    
+    For each input ref:
+    - If `path` specified: target must exist, be a TOF artifact, phase must match, sha256 must match
+    - If no `path`: match by (phase + sha256) in by_sha
+    - Detects: self-reference, duplicate phase, phase mismatch, sha mismatch
+    
+    Returns warnings list (non-fatal issues).
+    """
+    warnings: List[str] = []
+    
+    for art in artifacts:
+        seen_phases: set[str] = set()
+        for ref in art.inputs:
+            # --- Self-reference check ---
+            if ref.path:
+                target_abs = (art.path.parent / ref.path).resolve()
+                if target_abs == art.path.resolve():
+                    ref.valid = False
+                    ref.reason = "self-reference: input path points to own artifact"
+                    continue
+            
+            # --- Duplicate phase check ---
+            if ref.declared_phase in seen_phases:
+                ref.valid = False
+                ref.reason = f"duplicate phase reference: {ref.declared_phase}"
+                continue
+            seen_phases.add(ref.declared_phase)
+            
+            if ref.path:
+                # --- Path-based resolution ---
+                target_path = (art.path.parent / ref.path).resolve()
+                if not target_path.exists():
+                    ref.valid = False
+                    ref.reason = f"input path not found: {ref.path}"
+                    continue
+                target = by_path.get(str(target_path))
+                if target is None:
+                    ref.valid = False
+                    ref.reason = f"path exists but is not a TOF artifact: {ref.path}"
+                    continue
+                if target.phase != ref.declared_phase:
+                    ref.valid = False
+                    ref.reason = (f"input phase mismatch: declared={ref.declared_phase} "
+                                  f"but {ref.path} has phase={target.phase}")
+                    continue
+                if target.sha256 != ref.sha256:
+                    ref.valid = False
+                    ref.reason = f"sha256 mismatch for {ref.path}"
+                    continue
+                ref.resolved = target
+                ref.valid = True
+            else:
+                # --- Phase+sha resolution (no path) ---
+                candidates = by_sha.get(ref.sha256, [])
+                phase_candidates = [c for c in candidates if c.phase == ref.declared_phase]
+                if not phase_candidates:
+                    ref.valid = False
+                    ref.reason = (f"no artifact found for phase={ref.declared_phase} "
+                                  f"with matching sha256={ref.sha256[:16]}...")
+                    continue
+                if len(phase_candidates) > 1:
+                    warnings.append(
+                        f"{art.path.name}: multiple artifacts match phase={ref.declared_phase} "
+                        f"sha256={ref.sha256[:16]}...; using first"
+                    )
+                ref.resolved = phase_candidates[0]
+                ref.valid = True
+    
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Model registry helpers
+# ---------------------------------------------------------------------------
+
+def load_model_registry(models_yaml: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    models = models_yaml.get("models", {})
+    if not isinstance(models, dict):
+        return {}
+    return models
+
+
+def produced_by(fm: Dict[str, Any]) -> Dict[str, Any]:
+    tof = fm.get("tof")
+    if not isinstance(tof, dict):
+        return {}
+    pb = tof.get("produced_by")
+    return pb if isinstance(pb, dict) else {}
+
+
+def resolve_family_for_artifact(art: Artifact, models: Dict[str, Dict[str, Any]],
+                                session_metadata: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Return (family, error). Registry is authority; session metadata preferred over artifact self-report."""
+    pb = produced_by(art.frontmatter)
+    model_id = pb.get("assigned_model") or pb.get("claimed_model")
+    if model_id and model_id not in models:
+        return None, f"unknown model family for model_id={model_id}"
+
+    registry_family = models.get(model_id, {}).get("family") if model_id else None
+
+    # P2.x: prefer session metadata actual_family (adapter-confirmed)
+    # over artifact self-reported actual_family.
+    if session_metadata and art.phase in session_metadata:
+        meta = session_metadata[art.phase]
+        method = meta.get("method") or meta.get("verification_method", "unverified")
+        if method in ("adapter_confirmed", "log_parsed"):
+            meta_family = meta.get("actual_family")
+            if meta_family:
+                if registry_family and str(meta_family) != str(registry_family):
+                    return None, (
+                        f"session audit family={meta_family} != "
+                        f"registry family={registry_family} for {model_id}"
+                    )
+                return str(meta_family), None
+
+    actual_family = pb.get("actual_family")
+
+    if actual_family and registry_family:
+        if str(actual_family) != str(registry_family):
+            return None, (
+                f"model family mismatch: assigned_model={model_id} "
+                f"registry_family={registry_family} but artifact claims actual_family={actual_family}"
+            )
+        return str(actual_family), None
+
+    if registry_family:
+        return str(registry_family), None
+    # Safety: if model_id is not in registry, we CANNOT trust artifact self-reported actual_family.
+    # Artifact frontmatter is evidence, not authority — only adapter-verified facts can establish family.
+    return None, f"cannot determine model family: assigned_model={model_id} not in registry and no adapter facts available"
+
+
+# ---------------------------------------------------------------------------
+# Per-artifact validation checks
+# ---------------------------------------------------------------------------
+
+def compute_artifact_checks(art: Artifact, phase_cfg: Dict[str, Any],
+                            by_phase: Dict[str, List[Artifact]],
+                            latest_by_phase: Dict[str, Artifact],
+                            models: Dict[str, Dict[str, Any]],
+                            session_metadata: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Compute all checks for a single artifact. Returns {checks, reasons, status, verdict}."""
+    reasons: List[str] = []
+    checks: Dict[str, str] = {}
+
+    # Forbidden next_allowed field
+    forbidden_paths = find_forbidden_next_allowed(art.frontmatter)
+    for p in forbidden_paths:
+        warn(f"{art.path.name}: frontmatter field '{p}' is evidence, not authority; ignoring")
+        reasons.append(f"ignored artifact-declared {p}; transition derived from pipeline.yaml")
+
+    checks["schema"] = validate_schema(art, phase_cfg, reasons)
+    checks["input_linkage"] = validate_input_linkage(art, phase_cfg, by_phase, reasons)
+    checks["model_policy"] = validate_model_policy(art, phase_cfg, latest_by_phase, models, reasons, session_metadata)
+
+    # Verdict
+    try:
+        verdict = str(get_path(art.frontmatter, str(phase_cfg.get("verdict_field"))))
+    except KeyError:
+        verdict = None
+
+    any_check_blocking = any(v in {"FAIL", "BLOCKING"} for v in checks.values())
+
+    if any_check_blocking:
+        status = "INVALID"
+    elif verdict in {"BLOCKING", "FAIL"}:
+        status = "BLOCKING"
+    elif verdict in PASSISH_VERDICTS:
+        status = "PASS"
+    else:
+        status = verdict or "UNKNOWN"
+
+    # Transition / retry only for valid artifacts
+    next_allowed: List[Any] = []
+    if not any_check_blocking and verdict in {"BLOCKING", "FAIL"} | PASSISH_VERDICTS:
+        checks_real = dict(checks)
+        checks_real["transition"], next_allowed = derive_transition(art, phase_cfg, by_phase, reasons)
+        checks_real["retry_budget"], next_allowed = validate_retry_budget(art, phase_cfg, by_phase, next_allowed, reasons)
+        checks = checks_real
+
+    return {
+        "checks": checks,
+        "status": status,
+        "verdict": verdict,
+        "next_allowed": next_allowed,
+        "reasons": reasons,
+    }
+
+
+def validate_schema(art: Artifact, phase_cfg: Dict[str, Any], reasons: List[str]) -> str:
+    ok = True
+    field_rules = phase_cfg.get("field_rules", {}) or {}
+    if not isinstance(field_rules, dict):
+        field_rules = {}
+
+    for dotted in phase_cfg.get("required_fields", []) or []:
+        if not isinstance(dotted, str):
+            continue
+        rules = field_rules.get(dotted, {}) or {}
+        allow_empty = rules.get("allow_empty", False)
+        if allow_empty:
+            try:
+                get_path(art.frontmatter, dotted)
+            except KeyError:
+                ok = False
+                reasons.append(f"missing required field: {dotted}")
+        elif not has_nonempty_path(art.frontmatter, dotted):
+            ok = False
+            reasons.append(f"missing or empty required field: {dotted}")
+
+    # required_if_verdict: conditional fields only required for specific verdicts
+    verdict_field = phase_cfg.get("verdict_field")
+    declared_verdict = None
+    if verdict_field:
+        try:
+            declared_verdict = str(get_path(art.frontmatter, str(verdict_field)))
+        except KeyError:
+            pass
+    required_if_verdict = phase_cfg.get("required_if_verdict", {}) or {}
+    if isinstance(required_if_verdict, dict) and declared_verdict:
+        conditional_fields = required_if_verdict.get(declared_verdict, []) or []
+        for dotted in conditional_fields:
+            if not isinstance(dotted, str) or not has_nonempty_path(art.frontmatter, dotted):
+                ok = False
+                reasons.append(f"missing or empty required field for verdict={declared_verdict}: {dotted}")
+
+    # --- Echo detection: FILL WITH tokens remaining in frontmatter ---
+    if _check_echo(art, reasons):
+        ok = False
+
+    if field_rules:
+        for dotted, rules in field_rules.items():
+            if not isinstance(rules, dict):
+                continue
+            try:
+                value = get_path(art.frontmatter, dotted)
+            except KeyError:
+                ok = False
+                reasons.append(f"field rule target missing: {dotted}")
+                continue
+            if "min_items" in rules:
+                min_items = int(rules["min_items"])
+                if not hasattr(value, "__len__") or isinstance(value, (str, bytes)) or len(value) < min_items:
+                    ok = False
+                    actual = len(value) if hasattr(value, "__len__") and not isinstance(value, (str, bytes)) else "non-list"
+                    reasons.append(f"{dotted}.min_items={min_items} failed (actual={actual})")
+
+    verdict_field = phase_cfg.get("verdict_field")
+    verdicts = phase_cfg.get("verdicts", {}) or {}
+    if not isinstance(verdict_field, str):
+        ok = False
+        reasons.append("phase has no verdict_field in pipeline.yaml")
+    else:
+        try:
+            verdict = get_path(art.frontmatter, verdict_field)
+        except KeyError:
+            ok = False
+            reasons.append(f"missing verdict field: {verdict_field}")
+        else:
+            if not is_nonempty(verdict):
+                ok = False
+                reasons.append(f"empty verdict field: {verdict_field}")
+            elif str(verdict) not in verdicts:
+                ok = False
+                valid = ", ".join(str(v) for v in verdicts.keys())
+                reasons.append(f"invalid verdict {verdict_field}={verdict!r}; valid: {valid}")
+    return "PASS" if ok else "BLOCKING"
+
+
+def _check_echo(art: Artifact, reasons: List[str]) -> bool:
+    """Detect echo: any frontmatter value containing unreplaced template markers.
+
+    After _preprocess_prompt, legitimate templates become {{FIELD: ...}} or
+    {{SHA_WILL_BE_INJECTED}} markers. If these survive into the artifact
+    frontmatter, the model echoed the template back instead of filling it in.
+    """
+    found: List[str] = []
+    def _scan(obj: Any, path: str = "") -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _scan(v, f"{path}.{k}" if path else k)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                _scan(item, f"{path}[{i}]")
+        elif isinstance(obj, str) and ("{{FIELD:" in obj or "{{SHA_" in obj):
+            found.append(f"echo: {path}=\"{obj[:80]}\"")
+    _scan(art.frontmatter)
+    for e in found:
+        reasons.append(e)
+    return len(found) > 0
+
+
+def derive_transition(art: Artifact, phase_cfg: Dict[str, Any],
+                      grouped: Dict[str, List[Artifact]],
+                      reasons: List[str]) -> Tuple[str, List[Any]]:
+    verdict_field = phase_cfg.get("verdict_field")
+    verdicts = phase_cfg.get("verdicts", {}) or {}
+    try:
+        verdict = str(get_path(art.frontmatter, str(verdict_field)))
+    except KeyError:
+        return "BLOCKING", []
+    rule = verdicts.get(verdict)
+    if not isinstance(rule, dict):
+        return "BLOCKING", []
+
+    next_value = rule.get("next")
+    retry = rule.get("retry")
+    if retry:
+        try:
+            max_rounds = int(retry.get("max_rounds"))
+        except (TypeError, ValueError):
+            reasons.append(f"retry policy for {art.phase}.{verdict} has invalid max_rounds")
+            return "BLOCKING", []
+        retry_count = len(grouped.get(art.phase, []))
+        exhausted = retry.get("exhausted")
+        if retry_count >= max_rounds:
+            next_value = exhausted
+            reasons.append(f"retry_count={retry_count} >= max_rounds={max_rounds}; exhausted routes to {exhausted}")
+        else:
+            reasons.append(f"retry_count={retry_count} < max_rounds={max_rounds}")
+    reasons.append(f"{phase_cfg.get('verdict_field')}={verdict} routes to {next_value}")
+    if next_value is None:
+        return "PASS", []
+    return "PASS", [next_value]
+
+
+def validate_input_linkage(art: Artifact, phase_cfg: Dict[str, Any],
+                           by_phase: Dict[str, List[Artifact]],
+                           reasons: List[str]) -> str:
+    """Check pipeline.yaml input requirements against resolved InputRefs.
+
+    All refs must be resolved and valid. Uses pre-computed InputRef.valid flags
+    set by resolve_input_edges().
+    """
+    inputs_cfg = phase_cfg.get("inputs", {})
+    if inputs_cfg in (None, {}):
+        inputs_cfg = {}
+    if not isinstance(inputs_cfg, dict):
+        return "PASS"
+
+    ok = True
+
+    # Collect refs by phase (list — preserves duplicates for error reporting)
+    refs_by_phase: Dict[str, List[InputRef]] = {}
+    for ref in art.inputs:
+        if ref.declared_phase:
+            refs_by_phase.setdefault(ref.declared_phase, []).append(ref)
+
+    # Detect duplicate phase refs
+    for phase, refs in refs_by_phase.items():
+        if len(refs) > 1:
+            ok = False
+            reasons.append(f"input linkage: duplicate phase reference '{phase}' — exactly one input per phase required")
+
+    # Check required
+    for req_phase in inputs_cfg.get("required", []) or []:
+        req_phase = str(req_phase)
+        if req_phase not in refs_by_phase:
+            ok = False
+            reasons.append(f"input linkage missing required upstream: {req_phase}")
+            continue
+        for ref in refs_by_phase[req_phase]:
+            if not ref.valid:
+                ok = False
+                reasons.append(f"input linkage for {req_phase}: {ref.reason}")
+
+    # Check required_if_present
+    for req_if_phase in inputs_cfg.get("required_if_present", []) or []:
+        req_if_phase = str(req_if_phase)
+        # Does this phase have any artifact in the run?
+        if req_if_phase not in by_phase:
+            continue
+        # Phase exists — must be referenced
+        if req_if_phase not in refs_by_phase:
+            ok = False
+            reasons.append(f"input linkage: phase={req_if_phase} exists in run but not referenced (required_if_present)")
+            continue
+        for ref in refs_by_phase[req_if_phase]:
+            if not ref.valid:
+                ok = False
+                reasons.append(f"input linkage for {req_if_phase}: {ref.reason}")
+
+    return "PASS" if ok else "BLOCKING"
+
+
+def validate_model_policy(art: Artifact, phase_cfg: Dict[str, Any],
+                          latest_by_phase: Dict[str, Artifact],
+                          models: Dict[str, Dict[str, Any]],
+                          reasons: List[str],
+                          session_metadata: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    policy = phase_cfg.get("model_policy") or {}
+    if not isinstance(policy, dict) or not policy:
+        return "PASS"
+    ok = True
+    if "family_must_differ_from" in policy:
+        other_phase = str(policy["family_must_differ_from"])
+        other = latest_by_phase.get(other_phase)
+        if other is None:
+            reasons.append(f"model policy cannot find phase={other_phase}")
+            return "BLOCKING"
+        cur_family, cur_error = resolve_family_for_artifact(art, models, session_metadata)
+        other_family, other_error = resolve_family_for_artifact(other, models, session_metadata)
+        if cur_error:
+            ok = False
+            reasons.append(cur_error)
+        if other_error:
+            ok = False
+            reasons.append(other_error)
+        if cur_family and other_family and cur_family == other_family:
+            ok = False
+            reasons.append(f"model family must differ from {other_phase} (both {cur_family})")
+        elif cur_family and other_family:
+            reasons.append(f"model family differs from {other_phase}: {cur_family} != {other_family}")
+    return "PASS" if ok else "BLOCKING"
+
+
+def validate_retry_budget(art: Artifact, phase_cfg: Dict[str, Any],
+                          grouped: Dict[str, List[Artifact]],
+                          next_allowed: List[Any],
+                          reasons: List[str]) -> Tuple[str, List[Any]]:
+    verdict_field = phase_cfg.get("verdict_field")
+    verdicts = phase_cfg.get("verdicts", {}) or {}
+    try:
+        verdict = str(get_path(art.frontmatter, str(verdict_field)))
+    except KeyError:
+        return "BLOCKING", next_allowed
+    rule = verdicts.get(verdict)
+    if not isinstance(rule, dict) or "retry" not in rule:
+        return "PASS", next_allowed
+    retry = rule["retry"] or {}
+    try:
+        max_rounds = int(retry.get("max_rounds"))
+    except (TypeError, ValueError):
+        return "BLOCKING", next_allowed
+    count = len(grouped.get(art.phase, []))
+    if count >= max_rounds:
+        exhausted = retry.get("exhausted")
+        reasons.append(f"retry budget exhausted: count={count} >= max_rounds={max_rounds}; next_allowed={exhausted}")
+        return "PASS", ([] if exhausted is None else [exhausted])
+    return "PASS", next_allowed
+
+
+def find_forbidden_next_allowed(obj: Any, prefix: str = "") -> List[str]:
+    found: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key_path = f"{prefix}.{k}" if prefix else str(k)
+            if k == "next_allowed":
+                found.append(key_path)
+            found.extend(find_forbidden_next_allowed(v, key_path))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found.extend(find_forbidden_next_allowed(v, f"{prefix}[{i}]"))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Stale detection & frontier (P0.2a core)
+# ---------------------------------------------------------------------------
+
+def find_causal_frontier(phase_names: List[str], artifact_results: Dict[str, Any],
+                          by_phase: Dict[str, List[Artifact]],
+                          latest_by_phase: Dict[str, Artifact]) -> Tuple[Optional[str], Optional[Artifact]]:
+    """Find the latest causal-valid artifact frontier.
+    
+    An artifact is causal-valid if:
+    - Its checks all PASS (status PASS or BLOCKING, not INVALID)
+    - All required upstream inputs are resolved and valid
+    
+    Returns (status_string, artifact) where status_string is the frontier's status
+    or None if no valid frontier exists.
+    """
+    # For P0.2a: find the latest phase (by DAG order) that has a valid artifact
+    frontier_art: Optional[Artifact] = None
+    frontier_status: Optional[str] = None
+    
+    for phase in reversed(phase_names):
+        latest = latest_by_phase.get(phase)
+        if latest is None:
+            continue
+        result = artifact_results.get(latest.sha256)
+        if result is None:
+            continue
+        st = result.get("status")
+        if st == "INVALID":
+            # Check if there's an earlier round that's valid
+            revisions = by_phase.get(phase, [])
+            for art in reversed(revisions):
+                r = artifact_results.get(art.sha256)
+                if r and r.get("status") != "INVALID" and r.get("status") != "UNKNOWN":
+                    frontier_art = art
+                    frontier_status = r["status"]
+                    break
+        else:
+            frontier_art = latest
+            frontier_status = st
+        if frontier_art:
+            break
+    
+    return frontier_status, frontier_art
+
+
+def check_stale(current_art: Artifact, by_phase: Dict[str, List[Artifact]],
+                artifact_results: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Check if current_art references stale upstream artifacts.
+    
+    Returns (is_stale, reasons).
+    An artifact is stale if any of its input refs points to an upstream phase
+    that has a newer artifact which is itself valid (not INVALID).
+    """
+    stale_reasons: List[str] = []
+    for ref in current_art.inputs:
+        if not ref.valid or not ref.resolved:
+            continue
+        phase = ref.declared_phase
+        revisions = by_phase.get(phase, [])
+        for candidate in reversed(revisions):
+            if candidate is ref.resolved:
+                break  # no newer revision
+            if candidate.round <= ref.resolved.round and candidate.path == ref.resolved.path:
+                continue
+            # This is a newer artifact. Is it valid?
+            cres = artifact_results.get(candidate.sha256)
+            if cres and cres.get("status") not in ("INVALID", "UNKNOWN", None):
+                # Newer valid artifact exists with different content
+                if candidate.sha256 != ref.sha256:
+                    return True, [
+                        f"stale downstream: {current_art.path.name} references "
+                        f"{ref.declared_phase} round {ref.resolved.round}, but phase has newer "
+                        f"valid artifact (round {candidate.round}) with different content"
+                    ]
+                else:
+                    # Same content, idempotent re-run — not stale
+                    break
+    return False, stale_reasons
+
+
+def apply_stale_to_all(artifacts: List[Artifact], by_phase: Dict[str, List[Artifact]],
+                       artifact_results: Dict[str, Any]) -> None:
+    """Run stale detection for all artifacts, writing results into artifact_results.
+    
+    STALE artifacts are marked INVALID in artifact_results — making them excluded
+    from causal_frontier naturally.
+    """
+    for art in artifacts:
+        if art.sha256 not in artifact_results:
+            continue
+        result = artifact_results[art.sha256]
+        # Only check artifacts that aren't already INVALID from other checks
+        if result.get("status") == "INVALID":
+            continue
+        is_stale, s_reasons = check_stale(art, by_phase, artifact_results)
+        if is_stale:
+            result["checks"]["stale"] = "BLOCKING"
+            result["status"] = "INVALID"
+            result["reasons"].extend(s_reasons)
+
+
+def apply_session_fallback(artifacts: List[Artifact], run_dir: Path,
+                           artifact_results: Dict[str, Any],
+                           pipeline: Dict[str, Any],
+                           models: Optional[Dict[str, Dict[str, Any]]] = None,
+                           allow_untrusted_audit: bool = False) -> None:
+    """Read .session-metadata-*.json files and apply outcome-driven validation.
+
+    P0 provenance gate: metadata from untrusted sources (fixture, unverified,
+    self_reported without registry backing) is rejected unless
+    allow_untrusted_audit=True.
+
+    Outcome mapping (after gate passes):
+    - verified_match → no action (trust chain intact)
+    - verified_mismatch / unknown_model → INVALID (trust broken)
+    - unverified / unavailable / exception → BLOCKING (cannot verify)
+    - no metadata file → BLOCKING (audit gap)
+
+    For adapter_confirmed / log_parsed methods, cross-validates actual_model
+    vs assigned_model and actual_family vs artifact self-reported family.
+
+    This is fail-closed: any non-verified_match outcome blocks or invalidates.
+
+    Exemption: phases with approval_policy='always' (e.g. clarify) skip audit
+    because they are human-produced, not OT-dispatched.
+    """
+    phases_cfg = pipeline.get("phases", {})
+
+    for art in artifacts:
+        if art.sha256 not in artifact_results:
+            continue
+        result = artifact_results[art.sha256]
+        if result.get("status") == "INVALID":
+            # Intentional short-circuit: INVALID artifacts have already failed
+            # schema, input_linkage, or model_policy checks. Session audit
+            # cannot reverse an INVALID verdict — it can only add additional
+            # reasons. Skipping saves work without weakening the trust chain.
+            continue
+
+        # Exempt human-produced phases from session audit
+        phase_cfg = phases_cfg.get(art.phase, {})
+        if phase_cfg.get("approval_policy") == "always":
+            result["checks"]["session_audit"] = "NA"
+            continue
+
+        meta_path = run_dir / f".session-metadata-{art.phase}.json"
+        if not meta_path.exists():
+            result["checks"]["session_audit"] = "BLOCKING"
+            result["status"] = "BLOCKING"
+            result.setdefault("reasons", []).append(
+                f"session audit: no metadata file for phase '{art.phase}' — "
+                f"audit never ran or metadata was lost"
+            )
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+
+            # ================================================================
+            # P0.1 — PROVENANCE GATE
+            # Distinguish trusted evidence (adapter_confirmed/log_parsed from
+            # real OT dispatch) from untrusted evidence (fixture/hand-written/
+            # self_reported without registry backing).
+            # ================================================================
+            method = meta.get("method") or meta.get("verification_method", "unverified")
+
+            if not allow_untrusted_audit:
+                if method in ("fixture", "unverified"):
+                    result["checks"]["session_audit"] = "BLOCKING"
+                    result["status"] = "BLOCKING"
+                    result.setdefault("reasons", []).append(
+                        f"session audit: untrusted evidence source "
+                        f"(method={method}) — metadata was not produced by "
+                        f"an OT dispatch trace. Use --allow-untrusted-audit "
+                        f"to bypass this gate for fixture/testing scenarios."
+                    )
+                    continue
+
+                if method == "self_reported":
+                    assigned = meta.get("assigned_model", "")
+                    dv = "unverified"
+                    if models and assigned in models:
+                        dv = str(models[assigned].get(
+                            "default_verification", "unverified"))
+                    if dv != "self_reported":
+                        result["checks"]["session_audit"] = "BLOCKING"
+                        result["status"] = "BLOCKING"
+                        result.setdefault("reasons", []).append(
+                            f"session audit: self-reported identity not "
+                            f"trusted — model={assigned} "
+                            f"default_verification={dv}"
+                        )
+                        continue
+
+            # ================================================================
+            # P0.1b + P0.2 — CROSS-VALIDATION for trusted methods
+            # When evidence comes from a trusted source, cross-check that
+            # actual_model matches assigned_model, and that actual_family
+            # is consistent with the artifact's self-reported family.
+            # ================================================================
+            if method in ("adapter_confirmed", "log_parsed"):
+                actual_model = meta.get("actual_model", "")
+                assigned_model = meta.get("assigned_model", "")
+                if (actual_model and assigned_model
+                        and actual_model != assigned_model
+                        and meta.get("outcome") == "verified_match"):
+                    result["checks"]["session_audit"] = "BLOCKING"
+                    result["status"] = "INVALID"
+                    result.setdefault("reasons", []).append(
+                        f"session audit: metadata contradiction — "
+                        f"outcome=verified_match but "
+                        f"assigned_model={assigned_model} != "
+                        f"actual_model={actual_model}"
+                    )
+                    continue
+
+                # P0.2: family override — prefer session audit actual_family
+                # over artifact self-reported actual_family
+                meta_family = meta.get("actual_family")
+                if meta_family:
+                    pb = produced_by(art.frontmatter)
+                    art_family = pb.get("actual_family")
+                    if (art_family
+                            and str(art_family) != str(meta_family)):
+                        result["checks"]["model_policy"] = "BLOCKING"
+                        if result.get("status") == "PASS":
+                            result["status"] = "BLOCKING"
+                        result.setdefault("reasons", []).append(
+                            f"model policy: artifact self-reports "
+                            f"actual_family={art_family} but session audit "
+                            f"found actual_family={meta_family} "
+                            f"(actual_model={actual_model})"
+                        )
+
+                # P1.3: provenance check — for trusted methods, require
+                # that the artifact body hash was found in OT stdout.
+                # This is the only mechanical defense against FM-1
+                # (orchestrator writing artifacts without real dispatch).
+                provenance = meta.get("provenance_verified")
+                if provenance is not True:
+                    result["checks"]["session_audit"] = "BLOCKING"
+                    result["status"] = "INVALID"
+                    result.setdefault("reasons", []).append(
+                        "session audit: provenance unverified — "
+                        "artifact body hash not found in OT stdout; "
+                        "possible orchestrator-written artifact (FM-1)"
+                    )
+                    continue
+
+            outcome = meta.get("outcome", "unverified")
+
+            if outcome == "verified_match":
+                result["checks"]["session_audit"] = "PASS"
+                continue
+            elif outcome in ("verified_mismatch", "unknown_model"):
+                # Provider-level fallback (e.g., OpenRouter 400→other model)
+                # is not a code defect — when allowed by policy, downgrade
+                # from INVALID to PASS with a WARNING annotation.
+                if (meta.get("fallback_detected") is True
+                        and pipeline.get("timeout_policy", {}).get(
+                            "allow_provider_fallback") is True):
+                    result["checks"]["session_audit"] = "WARNING"
+                    result.setdefault("reasons", []).append(
+                        f"session audit: provider fallback detected — "
+                        f"assigned={meta.get('assigned_model', '?')} "
+                        f"actual={meta.get('actual_model', '?')} "
+                        f"(allowed by allow_provider_fallback policy)"
+                    )
+                    continue
+                result["checks"]["session_audit"] = "BLOCKING"
+                result["status"] = "INVALID"
+                result.setdefault("reasons", []).append(
+                    f"session audit: {outcome} — "
+                    f"assigned={meta.get('assigned_model', '?')} "
+                    f"actual={meta.get('actual_model', '?')}"
+                )
+            else:
+                # unverified, unavailable, exception, or unknown value
+                result["checks"]["session_audit"] = "BLOCKING"
+                result["status"] = "BLOCKING"
+                result.setdefault("reasons", []).append(
+                    f"session audit: {outcome} — audit could not verify "
+                    f"model (reason: "
+                    f"{meta.get('unverified_reason', meta.get('exception', 'unknown'))})"
+                )
+        except (json.JSONDecodeError, KeyError, OSError):
+            result["checks"]["session_audit"] = "BLOCKING"
+            result["status"] = "BLOCKING"
+            result.setdefault("reasons", []).append(
+                f"session audit: metadata file corrupted or unreadable "
+                f"for phase '{art.phase}'"
+            )
+
+
+def cascade_invalidation(artifacts: List[Artifact],
+                         artifact_results: Dict[str, Any]) -> None:
+    """Unified invalidation cascade: any INVALID upstream → ALL dependents INVALID.
+
+    Unlike the old propagate_fallback_to_descendants, this cascades ALL INVALID
+    reasons (session_audit, stale, schema, input_linkage, etc.) transitively.
+    A trust chain is only as strong as its weakest link — one broken upstream
+    means every downstream artifact must be INVALID.
+    """
+    # Build reverse dependency map: input_sha → [dependent_sha, ...]
+    dependents: Dict[str, List[str]] = {}
+    for art in artifacts:
+        for inp in art.inputs:
+            if inp.resolved:
+                dep_sha = inp.resolved.sha256
+                if dep_sha not in dependents:
+                    dependents[dep_sha] = []
+                dependents[dep_sha].append(art.sha256)
+
+    # Iterate until no new INVALID artifacts
+    changed = True
+    while changed:
+        changed = False
+        for dep_sha, result in list(artifact_results.items()):
+            if result.get("status") != "INVALID":
+                continue
+            child_shas = dependents.get(dep_sha, [])
+            for child_sha in child_shas:
+                child_result = artifact_results.get(child_sha)
+                if child_result and child_result.get("status") != "INVALID":
+                    child_result["status"] = "INVALID"
+                    child_result.setdefault("reasons", []).append(
+                        "cascade: upstream artifact is INVALID — trust chain broken"
+                    )
+                    changed = True
+
+
+def resolve_current_attempt(phase_names: List[str], phase_cfgs: Dict[str, Any],
+                             latest_by_phase: Dict[str, Artifact],
+                             by_phase: Dict[str, List[Artifact]],
+                             artifact_results: Dict[str, Any]) -> Artifact:
+    """Select current attempt by following transition chains from DAG-latest artifact.
+    
+    If the DAG-latest artifact is valid and routes backward (e.g. Review BLOCKING →
+    establish), and the target phase has a newer valid artifact, switch to that
+    artifact. Also handles INVALID artifacts by checking what they were trying to
+    route to.
+    """
+    # Start from DAG-latest
+    current_art: Optional[Artifact] = None
+    for name in reversed(phase_names):
+        if name in latest_by_phase:
+            current_art = latest_by_phase[name]
+            break
+    assert current_art is not None
+
+    phase_index = {n: i for i, n in enumerate(phase_names)}
+    visited: set[str] = set()
+
+    for _ in range(len(phase_names) * 2):
+        if current_art.phase in visited:
+            break
+        visited.add(current_art.phase)
+
+        result = artifact_results.get(current_art.sha256, {})
+        status = result.get("status", "UNKNOWN")
+
+        if status != "INVALID":
+            # Valid artifact (PASS or BLOCKING) — this IS the current attempt.
+            # Do NOT backtrack from valid artifacts just because the verdict
+            # routes to a previous phase.
+            break
+
+        # INVALID artifact: try to find the real current attempt.
+        # Look at what it was trying to route to.
+        verdict = result.get("verdict")
+        if not verdict:
+            break
+        phase_cfg = phase_cfgs.get(current_art.phase, {})
+        verdicts = phase_cfg.get("verdicts", {})
+        rule = verdicts.get(verdict) if isinstance(verdicts, dict) else None
+
+        if not isinstance(rule, dict):
+            break
+
+        nxt = rule.get("next")
+        if not nxt or nxt not in phase_index or nxt not in latest_by_phase:
+            break
+
+        nxt_idx = phase_index.get(nxt, -1)
+        cur_idx = phase_index.get(current_art.phase, -1)
+
+        if nxt_idx >= cur_idx:
+            # Forward or same-phase — no earlier phase to backtrack to
+            break
+
+        # Backward transition: check if target phase has a valid artifact
+        target = latest_by_phase.get(nxt)
+        if target is None:
+            break
+        target_res = artifact_results.get(target.sha256, {})
+        if target_res.get("status") in ("INVALID", "UNKNOWN", None):
+            break
+
+        # Valid backtrack: switch to target artifact (e.g. stale Review → new Establish v2)
+        current_art = target
+
+    return current_art
+
+
+# ---------------------------------------------------------------------------
+# Main validation
+# ---------------------------------------------------------------------------
+
+def validate_run(run_dir: Path, fail_on: Optional[str] = None,
+                override_pipeline: Optional[Path] = None,
+                override_models: Optional[Path] = None,
+                allow_untrusted_audit: bool = False) -> int:
+    pipeline_path = override_pipeline or locate_config(run_dir, "pipeline.yaml")
+    models_path = override_models or locate_config(run_dir, "models.yaml")
+    pipeline = load_yaml_file(pipeline_path)
+    pipeline_sha = file_sha256(pipeline_path)
+    models_yaml = load_yaml_file(models_path)
+    models_sha = file_sha256(models_path)
+    models = load_model_registry(models_yaml)
+    phases = phase_items(pipeline)
+    phase_names = [name for name, _ in phases]
+    phase_cfgs = {name: cfg for name, cfg in phases}
+
+    # Model freshness check
+    freshness_warnings: List[str] = []
+    freshness_policy = pipeline.get("model_freshness", {})
+    if isinstance(freshness_policy, dict):
+        max_days = freshness_policy.get("max_staleness_days", 30)
+        on_stale = freshness_policy.get("on_stale", "warning")
+        now = _dt.datetime.now(_dt.timezone.utc).date()
+        for mid, mdata in models_yaml.get("models", {}).items():
+            checked = mdata.get("freshness_checked_at")
+            if not checked:
+                freshness_warnings.append(f"model {mid}: no freshness_checked_at date")
+                continue
+            try:
+                checked_date = _dt.date.fromisoformat(str(checked))
+                days = (now - checked_date).days
+                if days > max_days:
+                    msg = f"model {mid}: freshness_checked_at={checked} ({days}d ago, max={max_days}d)"
+                    freshness_warnings.append(msg)
+            except (ValueError, TypeError):
+                freshness_warnings.append(f"model {mid}: invalid freshness_checked_at={checked}")
+
+    artifacts = scan_artifacts(run_dir, pipeline)
+    if not artifacts:
+        first = next((name for name, cfg in phases if not cfg.get("optional")), phase_names[0])
+        receipt = {
+            "validation": {
+                "id": validation_id(),
+                "artifact": None,
+                "phase": first,
+                "verdict": None,
+                "status": "PENDING",
+                "next_allowed": [first],
+                "reasons": ["no TOF artifacts found"],
+                "checks": {},
+                "config": {
+                    "pipeline": {"path": str(pipeline_path), "sha256": pipeline_sha},
+                    "models": {"path": str(models_path), "sha256": models_sha},
+                },
+            }
+        }
+        print(json.dumps(receipt, indent=2))
+        return 0
+
+    # Build indices
+    by_path, by_phase, by_sha = build_indices(artifacts)
+    grouped, latest_by_phase = group_artifacts(artifacts)
+
+    # Resolve input edges
+    resolve_ws = resolve_input_edges(artifacts, by_path, by_phase, by_sha)
+    for w in resolve_ws:
+        warn(w)
+
+    # Pre-load session metadata for family resolution.
+    # This allows resolve_family_for_artifact to prefer adapter-confirmed
+    # actual_family over artifact self-reported values — closing the
+    # self-attestation loop identified in Round 2 review #3.
+    session_metadata: Dict[str, Dict[str, Any]] = {}
+    for art in artifacts:
+        meta_path = run_dir / f".session-metadata-{art.phase}.json"
+        if meta_path.exists():
+            try:
+                session_metadata[art.phase] = json.loads(meta_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Compute checks for all artifacts
+    artifact_results: Dict[str, Any] = {}
+    for art in artifacts:
+        phase_cfg = phase_cfgs.get(art.phase)
+        if phase_cfg is None:
+            continue
+        artifact_results[art.sha256] = compute_artifact_checks(
+            art, phase_cfg, by_phase, latest_by_phase, models,
+            session_metadata=session_metadata)
+
+    # Apply session fallback detection (reads .session-metadata-*.json)
+    apply_session_fallback(artifacts, run_dir, artifact_results, pipeline,
+                           models=models, allow_untrusted_audit=allow_untrusted_audit)
+
+    # Apply stale detection to all artifacts (writes back into artifact_results)
+    apply_stale_to_all(artifacts, by_phase, artifact_results)
+
+    # Unified cascade: ANY INVALID upstream → ALL dependents INVALID
+    cascade_invalidation(artifacts, artifact_results)
+
+    # Select current attempt via transition-aware resolution
+    current_art = resolve_current_attempt(phase_names, phase_cfgs, latest_by_phase, by_phase, artifact_results)
+
+    # Get current artifact's results
+    cur_result = artifact_results.get(current_art.sha256, {})
+    checks = dict(cur_result.get("checks", {}))
+    status = cur_result.get("status", "UNKNOWN")
+    verdict = cur_result.get("verdict")
+    next_allowed = list(cur_result.get("next_allowed", []))
+    reasons = list(cur_result.get("reasons", []))
+
+    # INVALID → override transition
+    if status == "INVALID":
+        next_allowed = []
+        required_action = "rerun_current_phase"
+    else:
+        required_action = None
+
+    # Model freshness: if on_stale=blocking and any model is stale, mark INVALID
+    if on_stale == "blocking" and freshness_warnings:
+        status = "INVALID"
+        next_allowed = []
+        required_action = "rerun_current_phase"
+        reasons.extend(f"freshness: {w}" for w in freshness_warnings)
+
+    # Find causal frontier (stale now in artifact_results, frontier correctly excludes stale)
+    frontier_status, frontier_art = find_causal_frontier(phase_names, artifact_results, by_phase, latest_by_phase)
+
+    # Build receipt
+    receipt: Dict[str, Any] = {
+        "validation": {
+            "id": validation_id(),
+            "artifact": current_art.path.name,
+            "phase": current_art.phase,
+            "verdict": verdict,
+            "status": status,
+            "next_allowed": next_allowed,
+            "reasons": reasons,
+            "checks": checks,
+        }
+    }
+    if status == "INVALID":
+        receipt["validation"]["required_action"] = "rerun_current_phase"
+    if frontier_art:
+        receipt["validation"]["causal_frontier"] = {
+            "artifact": frontier_art.path.name,
+            "phase": frontier_art.phase,
+            "status": frontier_status,
+        }
+    receipt["validation"]["config"] = {
+        "pipeline": {"path": str(pipeline_path), "sha256": pipeline_sha},
+        "models": {"path": str(models_path), "sha256": models_sha},
+    }
+    if freshness_warnings:
+        receipt["validation"]["freshness_warnings"] = freshness_warnings
+
+    print(json.dumps(receipt, indent=2))
+
+    if fail_on == "invalid" and status == "INVALID":
+        return 1
+    if fail_on == "blocking" and status in {"INVALID", "BLOCKING"}:
+        return 1
+    if fail_on == "nonpass" and status != "PASS":
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+
+def dotted_path_is_valid(path: Any) -> bool:
+    return isinstance(path, str) and bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$", path))
+
+
+def lint_pipeline(override_pipeline: Optional[Path] = None) -> int:
+    pipeline_path = override_pipeline or locate_config(None, "pipeline.yaml")
+    pipeline = load_yaml_file(pipeline_path)
+    phases = phase_items(pipeline)
+    phase_names_set = {name for name, _ in phases}
+    errors: List[str] = []
+    warnings: List[str] = []
+    referenced: set[str] = set()
+
+    for name, cfg in phases:
+        verdicts = cfg.get("verdicts")
+        if not isinstance(verdicts, dict) or not verdicts:
+            errors.append(f"phase {name}: missing verdicts mapping")
+            continue
+        for verdict, rule in verdicts.items():
+            if not isinstance(rule, dict):
+                errors.append(f"phase {name} verdict {verdict}: rule must be mapping")
+                continue
+            nxt = rule.get("next")
+            if nxt not in SPECIAL_NEXT and nxt not in phase_names_set:
+                errors.append(f"phase {name} verdict {verdict}: next={nxt!r} does not reference a phase or special value")
+            if nxt in phase_names_set:
+                referenced.add(nxt)
+            retry = rule.get("retry")
+            if retry is not None:
+                if not isinstance(retry, dict):
+                    errors.append(f"phase {name} verdict {verdict}: retry must be mapping")
+                else:
+                    exhausted = retry.get("exhausted")
+                    if exhausted not in SPECIAL_NEXT and exhausted not in phase_names_set:
+                        errors.append(f"phase {name} verdict {verdict}: retry.exhausted={exhausted!r} invalid")
+                    if exhausted in phase_names_set:
+                        referenced.add(exhausted)
+
+        for dotted in cfg.get("required_fields", []) or []:
+            if not dotted_path_is_valid(dotted):
+                errors.append(f"phase {name}: invalid required field path {dotted!r}")
+        required_if_verdict = cfg.get("required_if_verdict", {}) or {}
+        if isinstance(required_if_verdict, dict):
+            verdicts_dict = cfg.get("verdicts", {}) or {}
+            for verdict_val, fields in required_if_verdict.items():
+                if verdict_val not in verdicts_dict:
+                    errors.append(f"phase {name}: required_if_verdict.{verdict_val} is not a valid verdict")
+                if not isinstance(fields, list):
+                    errors.append(f"phase {name}: required_if_verdict.{verdict_val} must be a list")
+                    continue
+                for dotted in fields:
+                    if not dotted_path_is_valid(dotted):
+                        errors.append(f"phase {name}: invalid required_if_verdict.{verdict_val} path {dotted!r}")
+        elif required_if_verdict:
+            errors.append(f"phase {name}: required_if_verdict must be a mapping")
+        verdict_field = cfg.get("verdict_field")
+        if not dotted_path_is_valid(verdict_field):
+            errors.append(f"phase {name}: invalid verdict_field {verdict_field!r}")
+
+        inputs_cfg = cfg.get("inputs", {})
+        if isinstance(inputs_cfg, dict):
+            for group_key in ["required", "required_if_present"]:
+                group = inputs_cfg.get(group_key, []) or []
+                if not isinstance(group, list):
+                    errors.append(f"phase {name}: inputs.{group_key} must be a list")
+                    continue
+                for ref_phase in group:
+                    if ref_phase not in phase_names_set:
+                        errors.append(f"phase {name}: inputs.{group_key} references non-existent phase: {ref_phase}")
+                    else:
+                        referenced.add(ref_phase)
+        else:
+            errors.append(f"phase {name}: inputs must be a mapping")
+
+        model_policy = cfg.get("model_policy") or {}
+        if isinstance(model_policy, dict):
+            other = model_policy.get("family_must_differ_from")
+            if other is not None and other not in phase_names_set:
+                errors.append(f"phase {name}: model_policy.family_must_differ_from={other!r} is not a phase")
+        else:
+            errors.append(f"phase {name}: model_policy must be a mapping")
+
+        approval_policy = cfg.get("approval_policy")
+        if approval_policy == "never_if_schema_valid":
+            normal_nexts = [rule.get("next") for rule in verdicts.values() if isinstance(rule, dict) and rule.get("next") in phase_names_set]
+            if normal_nexts:
+                warnings.append(f"phase {name}: approval_policy never_if_schema_valid on non-terminal phase")
+
+    deposition = dict(phases).get("deposition")
+    if deposition is not None and (not isinstance(deposition, dict) or deposition.get("optional") is not True):
+        errors.append("deposition must be marked optional: true")
+
+    # Check model assignments against registry
+    models_yaml = load_yaml_file(locate_config(Path.cwd(), "models.yaml"))
+    model_registry = load_model_registry(models_yaml)
+    for name, cfg in phases:
+        if cfg.get("optional"):
+            continue
+        assigned = cfg.get("model")
+        if not assigned or not isinstance(assigned, str) or not assigned.strip():
+            errors.append(f"phase {name}: missing or empty model assignment")
+        elif assigned not in model_registry:
+            errors.append(f"phase {name}: model {assigned!r} not in models.yaml")
+
+    # Check top-level runtime policies
+    tp = pipeline.get("timeout_policy")
+    if isinstance(tp, dict):
+        for key in ["max_retries", "retry_interval_seconds"]:
+            if not isinstance(tp.get(key), int):
+                errors.append(f"timeout_policy.{key} must be an integer")
+        if tp.get("on_exhaustion") not in ("blocking_ex", None):
+            errors.append(f"timeout_policy.on_exhaustion must be 'blocking_ex'")
+    mf = pipeline.get("model_freshness")
+    if isinstance(mf, dict):
+        if not isinstance(mf.get("max_staleness_days"), int):
+            errors.append("model_freshness.max_staleness_days must be an integer")
+        if mf.get("on_stale") not in ("warning", "blocking"):
+            errors.append("model_freshness.on_stale must be 'warning' or 'blocking'")
+    vc = pipeline.get("verification_confidence")
+    if isinstance(vc, dict):
+        if not isinstance(vc.get("threshold"), (int, float)):
+            errors.append("verification_confidence.threshold must be a number")
+        if vc.get("on_low_confidence") not in ("info", "warning", "blocking"):
+            errors.append("verification_confidence.on_low_confidence must be 'info', 'warning', or 'blocking'")
+
+    for name, cfg in phases:
+        if name not in referenced and not cfg.get("optional") and name != phases[0][0]:
+            warnings.append(f"phase {name}: unused phase (not referenced by any verdict next/exhausted)")
+
+    result = {
+        "lint": {
+            "pipeline": str(pipeline_path),
+            "status": "FAIL" if errors else "PASS",
+            "errors": errors,
+            "warnings": warnings,
+        }
+    }
+    print(json.dumps(result, indent=2))
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
+# Execution ledger statistics
+# ---------------------------------------------------------------------------
+
+LEDGER_PATH = Path(
+    os.environ.get("TOF_LEDGER_PATH", os.path.expanduser("~/.hermes/tof-execution-ledger.jsonl"))
+)
+
+
+def triage_stats(ledger_path: Path = LEDGER_PATH) -> int:
+    if not ledger_path.exists():
+        print("No execution records yet.")
+        return 0
+
+    entries: List[Dict[str, Any]] = []
+    try:
+        with ledger_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError:
+        print("No execution records yet.")
+        return 0
+
+    if not entries:
+        print("No execution records yet.")
+        return 0
+
+    mode_counts: Dict[str, int] = {}
+    error_count = 0
+    for entry in entries:
+        mode = str(entry.get("mode") or "unknown")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        if str(entry.get("status") or "").upper() == "ERROR":
+            error_count += 1
+
+    full_seri_count = mode_counts.get("full-seri", 0)
+    single_stage_count = sum(count for mode, count in mode_counts.items() if mode != "full-seri")
+
+    print(f"Total executions: {len(entries)}")
+    print("By mode:")
+    print(f"  full-seri: {full_seri_count}")
+    print(f"  single-stage: {single_stage_count}")
+    for mode in sorted(mode_counts):
+        if mode != "full-seri":
+            print(f"  {mode}: {mode_counts[mode]}")
+    print(f"ERROR: {error_count}")
+    print("Last 10 entries:")
+    print(f"{'timestamp':<32} {'mode':<20} {'status':<10}")
+    for entry in entries[-10:]:
+        timestamp = str(entry.get("timestamp", ""))
+        mode = str(entry.get("mode", ""))
+        status = str(entry.get("status", ""))
+        print(f"{timestamp:<32} {mode:<20} {status:<10}")
+
+    # Triage-advice statistics
+    triage_entries = [e for e in entries if str(e.get("mode") or "") == "triage-advice"]
+    if triage_entries:
+        route_counts: Dict[str, int] = {}
+        for e in triage_entries:
+            r = str(e.get("route") or "unknown")
+            route_counts[r] = route_counts.get(r, 0) + 1
+
+        review_only_advice = route_counts.get("review-only", 0)
+        actual_single_review = mode_counts.get("single-review", 0)
+
+        print(f"\nTriage advice ({len(triage_entries)} recommendations):")
+        for route in sorted(route_counts):
+            print(f"  {route}: {route_counts[route]}")
+        if review_only_advice > 0:
+            ratio = actual_single_review / review_only_advice
+            print(f"  → single-review dispatch rate vs triage review-only advice: {actual_single_review}/{review_only_advice} = {ratio:.1%}")
+            print(f"     (explicit compliance rate within TOF; does not include chat-level self-execution outside tof run)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="tof", description="TOF P0 minimal validator/runtime")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_validate = sub.add_parser("validate", help="validate the latest TOF artifact in a run directory")
+    p_validate.add_argument("run_dir", help="TOF run directory containing markdown artifacts")
+    p_validate.add_argument("--fail-on", choices=["invalid", "blocking", "nonpass"], default=None)
+    p_validate.add_argument("--pipeline", type=Path, default=None, help="explicit pipeline.yaml path")
+    p_validate.add_argument("--models", type=Path, default=None, help="explicit models.yaml path")
+    p_validate.add_argument("--allow-untrusted-audit", action="store_true", default=False,
+                            help="bypass provenance gate; accept fixture/hand-written metadata")
+
+    p_lint = sub.add_parser("lint-pipeline", help="check pipeline.yaml internal consistency")
+    p_lint.add_argument("--pipeline", type=Path, default=None, help="explicit pipeline.yaml path")
+
+    p_run = sub.add_parser("run", help="orchestrate a TOF run (receipt-driven loop)")
+    p_run.add_argument("run_dir", help="TOF run directory")
+    p_run.add_argument("--step", action="store_true", help="single-step, one phase only")
+    p_run.add_argument("--only", type=str, default=None,
+                       help="dispatch only this phase (e.g., review, scout, establish)")
+    p_run.add_argument("--task", type=str, default=None, help="task description for the clarify phase")
+
+    p_triage = sub.add_parser("triage", help="route a task to self-execution or TOF stage")
+    p_triage.add_argument("task", type=str, help="task description (quote if multi-word)")
+
+    sub.add_parser("triage-stats", help="show TOF execution ledger statistics")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "validate":
+        return validate_run(Path(args.run_dir).resolve(), fail_on=args.fail_on,
+                           override_pipeline=args.pipeline,
+                           override_models=args.models,
+                           allow_untrusted_audit=args.allow_untrusted_audit)
+    if args.command == "lint-pipeline":
+        return lint_pipeline(override_pipeline=args.pipeline)
+    if args.command == "run":
+        from orchestrator import run as orch_run
+        return orch_run(args.run_dir, step_mode=args.step, task=args.task,
+                        only_phase=args.only)
+    if args.command == "triage-stats":
+        return triage_stats()
+    if args.command == "triage":
+        pipeline_path = locate_config(Path.cwd(), "pipeline.yaml")
+        models_path = locate_config(Path.cwd(), "models.yaml")
+        pipeline = load_yaml_file(pipeline_path)
+        models_yaml = load_yaml_file(models_path)
+        models = load_model_registry(models_yaml)
+        tof_dir = pipeline_path.parent
+
+        from orchestrator import run_triage
+        try:
+            result = run_triage(args.task, pipeline, models, tof_dir)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
+    parser.error("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

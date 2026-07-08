@@ -1,0 +1,62 @@
+version: "0.1"
+dispatch_timeout_seconds: 300
+timeout_policy:
+  max_retries: 0
+  allow_provider_fallback: false
+model_freshness:
+  max_staleness_days: 9999
+  on_stale: warning
+phases:
+  scout:
+    artifact: RESEARCH.md
+    model: claude-opus-4.8
+    inputs: {}
+    required_fields:
+      - scout.affected_files
+      - scout.verification_functions
+      - scout.risk_areas
+      - scout.unknowns
+    field_rules:
+      scout.unknowns:
+        min_items: 1
+    verdict_field: scout.verdict
+    verdicts:
+      PASS:
+        next: establish
+  establish:
+    artifact: PLAN.md
+    model: gpt-5.5
+    inputs:
+      required:
+        - scout
+    required_fields:
+      - establish.architecture
+      - establish.steps
+    verdict_field: establish.verdict
+    verdicts:
+      READY:
+        next: review
+  review:
+    artifact: REVIEW.md
+    model: gemini-3.1-pro-preview
+    inputs:
+      required:
+        - scout
+        - establish
+    required_fields:
+      - review.verdict
+      - review.findings
+    required_if_verdict:
+      BLOCKING:
+        - review.blocking
+    verdict_field: review.verdict
+    model_policy:
+      family_must_differ_from: establish
+    verdicts:
+      PASS:
+        next: null
+      BLOCKING:
+        next: establish
+        retry:
+          max_rounds: 3
+          exhausted: escalation

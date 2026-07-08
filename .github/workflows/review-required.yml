@@ -1,0 +1,130 @@
+name: Review required
+
+on:
+  push:
+    paths:
+      - 'TOF/tof'
+      - 'TOF/orchestrator.py'
+      - 'TOF/pipeline.yaml'
+      - 'TOF/model_registry_adapter.py'
+      - 'TOF/session_audit_adapter.py'
+      - 'TOF/phases/**'
+  pull_request:
+    paths:
+      - 'TOF/tof'
+      - 'TOF/orchestrator.py'
+      - 'TOF/pipeline.yaml'
+      - 'TOF/model_registry_adapter.py'
+      - 'TOF/session_audit_adapter.py'
+      - 'TOF/phases/**'
+
+jobs:
+  check-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for REVIEW.md
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INSTRUCTIONS="This change touches TOF core files. It must be accompanied by a family-different REVIEW.md in the current diff.
+          Generate one with: tof run --only review <run_dir>
+          See CONTRIBUTING.md for details."
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+            if [[ "$BASE" =~ ^0+$ ]]; then
+              BASE="$(git rev-list --max-parents=0 "$HEAD")"
+            fi
+          fi
+
+          REVIEW_FILES="$(git diff --name-only "$BASE" "$HEAD" | grep -Ei '(^|/)REVIEW\.md$' || true)"
+
+          if [ -z "$REVIEW_FILES" ]; then
+            echo "::error::No REVIEW.md found."
+            printf '%s\n' "$INSTRUCTIONS"
+            exit 1
+          fi
+
+          if ! grep -Eq 'review\.verdict|^[[:space:]]*verdict[[:space:]]*:' $REVIEW_FILES; then
+            echo "::error::REVIEW.md found but missing review.verdict field."
+            printf '%s\n' "$INSTRUCTIONS"
+            exit 1
+          fi
+
+          echo "REVIEW.md found with review.verdict field: $REVIEW_FILES"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify reviewer family diversity
+        shell: bash
+        run: |
+          pip install pyyaml
+          python3 << 'PYEOF'
+          import yaml, sys, os
+
+          # Find REVIEW.md in the diff
+          review_files = os.popen('git diff --name-only ${{ github.event.before || github.event.pull_request.base.sha }} ${{ github.sha }} | grep -Ei "(^|/)REVIEW\\.md$"').read().strip().split('\n')
+          if not review_files or not review_files[0]:
+              print("::warning::No REVIEW.md in diff, skipping family check")
+              sys.exit(0)
+
+          review_path = review_files[0]
+          with open(review_path) as f:
+              content = f.read()
+
+          # Parse YAML frontmatter (between --- markers)
+          parts = content.split('---', 2)
+          if len(parts) < 3:
+              print("::error::REVIEW.md has no YAML frontmatter; invalid review artifact")
+              sys.exit(1)
+
+          fm = yaml.safe_load(parts[1])
+          reviewer = (fm.get('tof') or {}).get('reviewer', '')
+          if not reviewer:
+              print("::error::REVIEW.md missing tof.reviewer field; cannot verify reviewer family diversity")
+              sys.exit(1)
+
+          # Load models.yaml
+          with open('TOF/models.yaml') as f:
+              models_data = yaml.safe_load(f)
+          models = models_data.get('models', {})
+
+          # Find reviewer's family by matching provider_model_id
+          review_family = None
+          for model_name, cfg in models.items():
+              if cfg.get('provider_model_id') == reviewer:
+                  review_family = cfg.get('family')
+                  break
+
+          if not review_family:
+              print(f"::error::Reviewer '{reviewer}' not found in models.yaml; review artifact is unverifiable")
+              sys.exit(1)
+
+          # Load pipeline.yaml to find establish model
+          with open('TOF/pipeline.yaml') as f:
+              pipeline = yaml.safe_load(f)
+          establish_model = (pipeline.get('phases') or {}).get('establish', {}).get('model', '')
+          establish_cfg = models.get(establish_model, {})
+          establish_family = establish_cfg.get('family', '')
+
+          if not establish_family:
+              print("::warning::Cannot determine establish family, skipping family check")
+              sys.exit(0)
+
+          if review_family == establish_family:
+              print(f"::error::Reviewer family '{review_family}' matches establish family '{establish_family}'. TOF core changes require a family-different reviewer.")
+              sys.exit(1)
+
+          print(f"Family diversity verified: reviewer={review_family}, establish={establish_family}")
+          PYEOF

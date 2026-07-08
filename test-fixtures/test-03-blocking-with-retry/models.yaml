@@ -1,0 +1,47 @@
+# models.yaml — Model family registry
+# Used by tof validate to check model_policy constraints
+# Each model ID maps to a family for diversity verification.
+#
+# freshness_checked_at: ISO date when the model slug was last verified
+#   against the provider's /v1/models endpoint.
+# verification_method: how the model's identity is confirmed after dispatch
+#   - "adapter_confirmed": dispatch adapter returned verified identity
+#   - "log_parsed": reconstructed from execution logs
+#   - "self_reported": claimed by the model (lowest trust)
+#   - "unverified": no verification mechanism available
+
+models:
+  claude-opus-4.8:
+    family: claude
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  claude-sonnet-4:
+    family: claude
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  gpt-5.5:
+    family: gpt
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  gpt-5.4:
+    family: gpt
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  gemini-3.1-pro-preview:
+    family: gemini
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  deepseek-v4-pro:
+    family: deepseek
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
+
+  deepseek-v4-flash:
+    family: deepseek
+    freshness_checked_at: "2026-07-01"
+    default_verification: adapter_confirmed
