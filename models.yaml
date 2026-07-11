@@ -30,6 +30,20 @@ models:
     freshness_checked_at: "2026-07-01"
     default_verification: adapter_confirmed
 
+  gpt-5.6-sol:
+    family: gpt
+    provider: openrouter
+    provider_model_id: openai/gpt-5.6-sol
+    freshness_checked_at: "2026-07-11"
+    default_verification: adapter_confirmed
+
+  gpt-5.6-terra:
+    family: gpt
+    provider: openrouter
+    provider_model_id: openai/gpt-5.6-terra
+    freshness_checked_at: "2026-07-11"
+    default_verification: adapter_confirmed
+
   gpt-5.5:
     family: gpt
     provider: openrouter
