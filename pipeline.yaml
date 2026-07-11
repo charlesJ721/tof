@@ -56,12 +56,12 @@ dispatch:
 phases:
   # Standalone advisory phase — not part of the main SERI DAG
   triage:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     prompt: "phases/triage/prompt.md"
 
   clarify:
     artifact: TASK.md
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     inputs: {}
     required_fields:
       - task.scope
