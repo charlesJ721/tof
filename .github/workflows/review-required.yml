@@ -3,20 +3,20 @@ name: Review required
 on:
   push:
     paths:
-      - 'TOF/tof'
-      - 'TOF/orchestrator.py'
-      - 'TOF/pipeline.yaml'
-      - 'TOF/model_registry_adapter.py'
-      - 'TOF/session_audit_adapter.py'
-      - 'TOF/phases/**'
+      - 'tof'
+      - 'orchestrator.py'
+      - 'pipeline.yaml'
+      - 'model_registry_adapter.py'
+      - 'session_audit_adapter.py'
+      - 'phases/**'
   pull_request:
     paths:
-      - 'TOF/tof'
-      - 'TOF/orchestrator.py'
-      - 'TOF/pipeline.yaml'
-      - 'TOF/model_registry_adapter.py'
-      - 'TOF/session_audit_adapter.py'
-      - 'TOF/phases/**'
+      - 'tof'
+      - 'orchestrator.py'
+      - 'pipeline.yaml'
+      - 'model_registry_adapter.py'
+      - 'session_audit_adapter.py'
+      - 'phases/**'
 
 jobs:
   check-review:

@@ -3,10 +3,10 @@ name: TOF tests
 on:
   push:
     paths:
-      - 'TOF/**'
+      - '**'
   pull_request:
     paths:
-      - 'TOF/**'
+      - '**'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 5
     defaults:
       run:
-        working-directory: TOF
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
 
